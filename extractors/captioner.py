@@ -152,6 +152,17 @@ def _is_limit_zero(error_text: str) -> bool:
     return "limit: 0" in et or "limit:0" in et
 
 
+def _is_batch_doomed_429(error_text: str) -> bool:
+    """True if every other photo in the batch will hit the same 429.
+
+    Covers: limit:0 (zero free-tier quota allocated) and per-day quotas
+    (250/day for gemini-2.5-flash). Per-minute rate limits return False —
+    those are transient and may clear within the minute.
+    """
+    et = error_text.replace(" ", "").lower()
+    return _is_limit_zero(error_text) or "perday" in et
+
+
 def _classify_429(error_text: str) -> str:
     """Tell apart permanent quota issues from transient rate limits."""
     et = error_text.lower()
@@ -212,10 +223,11 @@ def generate_captions_parallel(
                 if code in (401, 403):
                     return i, "(AI caption failed: invalid or unauthorized Gemini API key)", True
                 if code == 429:
-                    # limit:0 is permanent — no retry will help, and it's the
-                    # same error every other photo will hit. Bail out fatally
-                    # so the whole batch stops fast.
-                    if _is_limit_zero(err_text):
+                    # limit:0 and per-day quota errors will hit every other
+                    # photo identically — no retry or per-minute backoff will
+                    # help today. Bail out fatally so the batch ends in seconds
+                    # instead of grinding through 12 × 25s of doomed retries.
+                    if _is_batch_doomed_429(err_text):
                         return i, f"({_classify_429(err_text)})", True
                     if attempt < DEFAULT_RATE_LIMIT_RETRIES:
                         _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
