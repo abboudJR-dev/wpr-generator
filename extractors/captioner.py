@@ -20,7 +20,7 @@ the newer Llama 4 multimodal variants when stable.
 from __future__ import annotations
 
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -247,18 +247,36 @@ def generate_captions_parallel(
         return [r or "(no result)" for r in results]
 
     workers = max(1, min(max_workers, total))
+    fatal_caption = None  # message to backfill into cancelled-slot results
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_run, i, r): i for i, r in enumerate(requests)}
         fatal_seen = False
         for fut in as_completed(futures):
-            i, caption, fatal = fut.result()
+            # Futures we cancelled in a previous iteration land here too —
+            # calling .result() on them raises CancelledError. Skip those;
+            # we backfill their slots after the loop.
+            try:
+                i, caption, fatal = fut.result()
+            except CancelledError:
+                continue
             results[i] = caption
             done += 1
             if progress_cb:
                 progress_cb(done, total)
             if fatal and not fatal_seen:
                 fatal_seen = True
+                fatal_caption = caption
                 for f in futures:
                     f.cancel()
+
+    # Cancelled futures left empty slots — fill them with the fatal message
+    # so the UI shows a clear reason for every photo instead of "(no result)".
+    if fatal_caption is not None:
+        for idx, r in enumerate(results):
+            if r is None:
+                results[idx] = fatal_caption
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total)
 
     return [r or "(no result)" for r in results]
