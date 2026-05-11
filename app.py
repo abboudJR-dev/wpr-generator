@@ -43,6 +43,7 @@ from builder.state import (
 from extractors.captioner import CaptionRequest, generate_captions_parallel
 from extractors.dcr import DCRData, parse_dcrs
 from extractors.logs import LogsData, parse_logs
+from extractors.photo_picker import pick_best_two, score_day_photos
 
 from PIL import Image
 
@@ -466,6 +467,58 @@ def section_photos(state: WPRState, dcrs: list[DCRData]):
     _render_ai_caption_block(state, dcrs)
 
 
+def _run_auto_pick(state: WPRState, dcrs: list[DCRData], api_key: str) -> None:
+    """Score each day's photos and write the top-2 indices into the per-day
+    selectbox widget keys, then rerun so the dropdowns + state catch up."""
+    total_days = min(6, len(dcrs))
+    progress = st.progress(0.0, text=f"Scoring photos for day 1/{total_days}…")
+
+    per_day_reports = []
+    for day_idx in range(total_days):
+        dcr = dcrs[day_idx]
+        if not dcr.photos or len(dcr.photos) < 2:
+            per_day_reports.append({
+                "scores": [], "a_idx": 0, "b_idx": 0,
+            })
+            progress.progress((day_idx + 1) / total_days,
+                              text=f"Day {day_idx + 1}/{total_days}: not enough photos to score")
+            continue
+
+        progress.progress(
+            day_idx / total_days,
+            text=f"Scoring {len(dcr.photos)} photos for day {day_idx + 1}/{total_days}…",
+        )
+
+        scores = score_day_photos(dcr.photos, api_key=api_key)
+        a_idx, b_idx = pick_best_two(scores)
+
+        # Write the new selections into the selectbox widget keys.
+        # The selectbox displays labels like "#1", "#2", ... so we encode the
+        # index by 1-based position in that same format.
+        st.session_state[f"sel_a_{day_idx}"] = f"#{a_idx + 1}"
+        st.session_state[f"sel_b_{day_idx}"] = f"#{b_idx + 1}"
+
+        per_day_reports.append({
+            "scores": scores,
+            "a_idx": a_idx,
+            "b_idx": b_idx,
+        })
+
+    st.session_state["auto_pick_results"] = per_day_reports
+    # Also clear any stale caption results — they were tied to the old picks.
+    if "ai_caption_results" in st.session_state:
+        del st.session_state["ai_caption_results"]
+    # Clear caption widget keys so new defaults render for the new picks.
+    for i in range(total_days):
+        for slot in ("a", "b"):
+            key = f"cap_{slot}_{i}"
+            if key in st.session_state:
+                del st.session_state[key]
+
+    progress.empty()
+    st.rerun()
+
+
 def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
     """The "Generate captions with AI" panel inside the Photos tab.
 
@@ -474,19 +527,17 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
     and writes the results back to state.photo_days. Clears the caption
     text-input widget keys before rerun so the new values render.
     """
-    st.subheader("AI caption generator")
+    st.subheader("AI photo tools")
     st.caption(
-        "Sends the selected Photo A / Photo B for each day to Groq's Llama 3.2 11B Vision, "
-        "along with that day's recorded site activities, and asks for a one-sentence "
-        "caption in the same tone as the reference deck. ~5-10 seconds for 12 photos. "
-        "Free key: https://console.groq.com (no credit card, ~14,400 free requests/day)."
+        "Powered by Groq Llama 3.2 11B Vision. Free key: https://console.groq.com "
+        "(no credit card, ~14,400 free requests/day)."
     )
 
     api_key = _resolve_groq_key()
     if not api_key:
         st.info(
-            "Enter your free Groq API key to enable AI captioning. "
-            "Get one at https://console.groq.com (no credit card, much higher free limit than Gemini). "
+            "Enter your free Groq API key to enable AI photo picking + captioning. "
+            "Get one at https://console.groq.com. "
             "Set `GROQ_API_KEY` in Streamlit Cloud Secrets to skip this every visit."
         )
         user_key = st.text_input(
@@ -496,6 +547,42 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
         if user_key:
             st.session_state["groq_api_key"] = user_key
             api_key = user_key
+
+    # ---- Auto-pick best photos ----
+    st.markdown("**Auto-pick best 2 photos per day**")
+    st.caption(
+        "Scores every extracted photo on three criteria — progress visibility, "
+        "safety (PPE compliance — hard hat + high-vis vest), and composition — "
+        "and selects the two highest-scoring per day. Photos showing workers "
+        "without proper PPE are excluded so the deck never embarrasses the contractor. "
+        "~15-30 seconds total. Run this BEFORE 'Generate captions with AI'."
+    )
+    pick_btn = st.button(
+        "Auto-pick best photos with AI",
+        disabled=not api_key, type="secondary", key="auto_pick_btn",
+    )
+
+    if pick_btn and api_key:
+        _run_auto_pick(state, dcrs, api_key)
+
+    # Show last-pick scoring summary if any
+    last_picks = st.session_state.get("auto_pick_results")
+    if last_picks:
+        with st.expander("Photo scoring details (from last auto-pick run)", expanded=False):
+            for day_idx, day_report in enumerate(last_picks):
+                day_label = state.photo_day_labels[day_idx] if day_idx < len(state.photo_day_labels) else f"Day {day_idx+1}"
+                st.markdown(f"**{day_label}** — picked photos {day_report['a_idx']+1} (Photo A) and {day_report['b_idx']+1} (Photo B)")
+                for s in day_report["scores"]:
+                    badge = "✅" if s.photo_index in (day_report["a_idx"], day_report["b_idx"]) else "⚪"
+                    err = f" — error: {s.error}" if s.error else ""
+                    st.markdown(
+                        f"{badge} Photo {s.photo_index + 1}: progress={s.progress}, "
+                        f"safety={s.safety}, composition={s.composition} "
+                        f"(overall {s.weighted_overall:.1f}). {s.rationale}{err}"
+                    )
+
+    st.markdown("---")
+    st.markdown("**Generate captions for selected photos**")
 
     gen_btn = st.button(
         "Generate captions with AI",
