@@ -40,10 +40,31 @@ from builder.state import (
     AOCEntry, ActivityRow, ConcreteRow, DayPhotos, LookaheadRow,
     ManpowerDay, NCREntry, ProgrammeRow, SubContractor, WPRState,
 )
+from extractors.captioner import CaptionRequest, generate_captions_parallel
 from extractors.dcr import DCRData, parse_dcrs
 from extractors.logs import LogsData, parse_logs
 
 from PIL import Image
+
+
+def _resolve_anthropic_key() -> Optional[str]:
+    """Look for the Anthropic key in: st.secrets → env var → session state.
+
+    Streamlit Cloud users set `ANTHROPIC_API_KEY` in the app's Secrets UI
+    (Settings → Secrets); local users can `export ANTHROPIC_API_KEY=…` or
+    enter it via the in-app prompt (kept in session memory only).
+    """
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+        if key:
+            return key
+    except (FileNotFoundError, KeyError, AttributeError):
+        # No secrets.toml or key not configured — fall through
+        pass
+    env_key = os.environ.get("ANTHROPIC_API_KEY")
+    if env_key:
+        return env_key
+    return st.session_state.get("anthropic_api_key")
 
 
 @st.cache_data(show_spinner=False)
@@ -439,6 +460,107 @@ def section_photos(state: WPRState, dcrs: list[DCRData]):
     state.photo_days = new_days
     state.photo_dates = new_dates
     state.photo_day_labels = new_labels
+
+    # ---- AI captioning (uses each day's activity list as context) ----
+    st.divider()
+    _render_ai_caption_block(state, dcrs)
+
+
+def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
+    """The "Generate captions with AI" panel inside the Photos tab.
+
+    Sends each selected A/B photo to Claude Haiku 4.5 with that day's
+    activity list as context, runs them in parallel via ThreadPoolExecutor,
+    and writes the results back to state.photo_days. Clears the caption
+    text-input widget keys before rerun so the new values render.
+    """
+    st.subheader("AI caption generator")
+    st.caption(
+        "Sends the selected Photo A / Photo B for each day to Claude Haiku 4.5, "
+        "along with that day's recorded site activities, and asks for a one-sentence "
+        "caption in the same tone as the reference deck. ~10-20 seconds for 12 photos."
+    )
+
+    api_key = _resolve_anthropic_key()
+    if not api_key:
+        st.info(
+            "Enter your Anthropic API key to enable AI captioning. "
+            "Set `ANTHROPIC_API_KEY` in Streamlit Cloud Secrets to skip this every visit."
+        )
+        user_key = st.text_input(
+            "Anthropic API key", type="password", key="api_key_input",
+            placeholder="sk-ant-…",
+        )
+        if user_key:
+            st.session_state["anthropic_api_key"] = user_key
+            api_key = user_key
+
+    gen_btn = st.button(
+        "Generate captions with AI",
+        disabled=not api_key, type="primary", key="gen_captions_btn",
+    )
+
+    if gen_btn and api_key:
+        # Map each selected A/B photo to a captioning request, with the DCR's
+        # activity list passed in as context.
+        reqs: list[CaptionRequest] = []
+        slot_map: list[tuple[int, str]] = []  # (day_index, "a"|"b")
+        for i, dp in enumerate(state.photo_days):
+            activities = dcrs[i].activities if i < len(dcrs) else []
+            if dp.photo_a_bytes:
+                reqs.append(CaptionRequest(
+                    image_bytes=dp.photo_a_bytes,
+                    media_type=("image/png" if dp.photo_a_ext == "png" else "image/jpeg"),
+                    activities=activities,
+                ))
+                slot_map.append((i, "a"))
+            if dp.photo_b_bytes:
+                reqs.append(CaptionRequest(
+                    image_bytes=dp.photo_b_bytes,
+                    media_type=("image/png" if dp.photo_b_ext == "png" else "image/jpeg"),
+                    activities=activities,
+                ))
+                slot_map.append((i, "b"))
+
+        if not reqs:
+            st.warning("No photos selected — pick at least one per day above first.")
+            return
+
+        progress = st.progress(0.0, text=f"Captioning 0/{len(reqs)}…")
+
+        def _on_progress(done: int, total: int) -> None:
+            progress.progress(done / max(total, 1), text=f"Captioning {done}/{total}…")
+
+        captions = generate_captions_parallel(
+            reqs, api_key=api_key, progress_cb=_on_progress,
+        )
+        progress.empty()
+
+        # Write captions back to state
+        for caption, (i, slot) in zip(captions, slot_map):
+            if slot == "a":
+                state.photo_days[i].caption_a = caption
+            else:
+                state.photo_days[i].caption_b = caption
+
+        # Clear the per-day caption text-input widget keys so they re-init
+        # from state.photo_days on the next render (Streamlit text inputs
+        # otherwise stick to whatever was previously typed).
+        for i in range(len(state.photo_days)):
+            for slot in ("a", "b"):
+                key = f"cap_{slot}_{i}"
+                if key in st.session_state:
+                    del st.session_state[key]
+
+        failures = sum(1 for c in captions if c.startswith("(AI caption failed"))
+        if failures:
+            st.warning(
+                f"Generated {len(captions) - failures}/{len(captions)} captions. "
+                f"{failures} failed — see individual fields above."
+            )
+        else:
+            st.success(f"Generated {len(captions)} captions. Scroll up to review and edit.")
+        st.rerun()
 
 
 # ---- Main ------------------------------------------------------------------
