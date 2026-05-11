@@ -36,7 +36,6 @@ def _output_dir() -> Path:
 OUTPUT_DIR = _output_dir()
 
 from builder.build import WEEKDAY_NAMES, build_pptx, state_from_inputs
-from builder.defaults import DEFAULT_PHOTO_CAPTIONS
 from builder.state import (
     AOCEntry, ActivityRow, ConcreteRow, DayPhotos, LookaheadRow,
     ManpowerDay, NCREntry, ProgrammeRow, SubContractor, WPRState,
@@ -407,21 +406,22 @@ def section_photos(state: WPRState, dcrs: list[DCRData]):
                          use_container_width=True)
 
         labels = [f"#{j+1}" for j in range(len(dcr.photos))]
-        # Default selections from existing state if any
+        # Default captions come from state.photo_days (which the build module
+        # seeded from each DCR's date) — generic placeholders the user edits.
         existing = state.photo_days[i] if i < len(state.photo_days) else None
         c1, c2 = st.columns(2)
         with c1:
             sel_a = st.selectbox(f"Day {i+1} — Photo A", labels,
                                  index=0, key=f"sel_a_{i}")
-            cap_a = st.text_input(f"Caption A", value=(existing.caption_a if existing else
-                                  (DEFAULT_PHOTO_CAPTIONS[i][0] if i < len(DEFAULT_PHOTO_CAPTIONS) else "")),
+            cap_a = st.text_input(f"Caption A",
+                                  value=(existing.caption_a if existing else ""),
                                   key=f"cap_a_{i}")
         with c2:
             default_b = labels[1] if len(labels) > 1 else labels[0]
             sel_b = st.selectbox(f"Day {i+1} — Photo B", labels,
                                  index=min(1, len(labels) - 1), key=f"sel_b_{i}")
-            cap_b = st.text_input(f"Caption B", value=(existing.caption_b if existing else
-                                  (DEFAULT_PHOTO_CAPTIONS[i][1] if i < len(DEFAULT_PHOTO_CAPTIONS) else "")),
+            cap_b = st.text_input(f"Caption B",
+                                  value=(existing.caption_b if existing else ""),
                                   key=f"cap_b_{i}")
 
         a_idx = labels.index(sel_a)
@@ -478,10 +478,16 @@ def main():
         progress.progress(1.0, text="Building draft state…")
         ss.dcrs = dcrs
         ss.logs = logs
-        ss.wpr = state_from_inputs(dcrs, logs, week_no=20)
+        # week_no, issue_date, report_ref, period etc. all auto-derive from DCR dates
+        ss.wpr = state_from_inputs(dcrs, logs)
         ss.generated_path = None
         progress.empty()
-        st.success(f"Parsed {len(dcrs)} DCRs and {len(logs.categories)} log categories.")
+        st.success(
+            f"Parsed {len(dcrs)} DCRs and {len(logs.categories)} log categories. "
+            f"Detected Week {ss.wpr.week_no} ({ss.wpr.period}). "
+            "Review every tab — narrative content (activities, AOCs, programme rows) "
+            "is pre-filled with Week 20 examples; edit them for your week."
+        )
 
     if not ss.wpr:
         st.info("Upload files and click **Extract** to begin.")
