@@ -47,24 +47,25 @@ from extractors.logs import LogsData, parse_logs
 from PIL import Image
 
 
-def _resolve_anthropic_key() -> Optional[str]:
-    """Look for the Anthropic key in: st.secrets → env var → session state.
+def _resolve_gemini_key() -> Optional[str]:
+    """Look for the Gemini key in: st.secrets → env var → session state.
 
-    Streamlit Cloud users set `ANTHROPIC_API_KEY` in the app's Secrets UI
-    (Settings → Secrets); local users can `export ANTHROPIC_API_KEY=…` or
-    enter it via the in-app prompt (kept in session memory only).
+    Streamlit Cloud users set `GEMINI_API_KEY` in the app's Secrets UI
+    (Settings → Secrets); local users can `set GEMINI_API_KEY=…` or enter
+    it via the in-app prompt (kept in session memory only). Get a free
+    key at https://aistudio.google.com/app/apikey (no credit card).
     """
-    try:
-        key = st.secrets.get("ANTHROPIC_API_KEY")
-        if key:
-            return key
-    except (FileNotFoundError, KeyError, AttributeError):
-        # No secrets.toml or key not configured — fall through
-        pass
-    env_key = os.environ.get("ANTHROPIC_API_KEY")
-    if env_key:
-        return env_key
-    return st.session_state.get("anthropic_api_key")
+    for env_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        try:
+            key = st.secrets.get(env_name)
+            if key:
+                return key
+        except (FileNotFoundError, KeyError, AttributeError):
+            pass
+        env_key = os.environ.get(env_name)
+        if env_key:
+            return env_key
+    return st.session_state.get("gemini_api_key")
 
 
 @st.cache_data(show_spinner=False)
@@ -476,23 +477,25 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
     """
     st.subheader("AI caption generator")
     st.caption(
-        "Sends the selected Photo A / Photo B for each day to Claude Haiku 4.5, "
+        "Sends the selected Photo A / Photo B for each day to Google Gemini 2.0 Flash, "
         "along with that day's recorded site activities, and asks for a one-sentence "
-        "caption in the same tone as the reference deck. ~10-20 seconds for 12 photos."
+        "caption in the same tone as the reference deck. ~10-20 seconds for 12 photos. "
+        "Free key: https://aistudio.google.com/app/apikey (no credit card)."
     )
 
-    api_key = _resolve_anthropic_key()
+    api_key = _resolve_gemini_key()
     if not api_key:
         st.info(
-            "Enter your Anthropic API key to enable AI captioning. "
-            "Set `ANTHROPIC_API_KEY` in Streamlit Cloud Secrets to skip this every visit."
+            "Enter your free Gemini API key to enable AI captioning. "
+            "Get one at https://aistudio.google.com/app/apikey (no credit card). "
+            "Set `GEMINI_API_KEY` in Streamlit Cloud Secrets to skip this every visit."
         )
         user_key = st.text_input(
-            "Anthropic API key", type="password", key="api_key_input",
-            placeholder="sk-ant-…",
+            "Gemini API key", type="password", key="api_key_input",
+            placeholder="AIza…",
         )
         if user_key:
-            st.session_state["anthropic_api_key"] = user_key
+            st.session_state["gemini_api_key"] = user_key
             api_key = user_key
 
     gen_btn = st.button(

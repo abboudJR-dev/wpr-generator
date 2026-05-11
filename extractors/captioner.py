@@ -1,33 +1,38 @@
-"""AI-powered photo caption generator.
+"""AI-powered photo caption generator (Google Gemini 2.0 Flash).
 
-Calls Claude Haiku 4.5 (vision) with the photo + that day's activity list
-as context. Returns one sentence in the same tone as the reference WPR
-deck's photo captions.
+Uses Gemini 2.0 Flash because it has the most generous free tier of any
+vision-capable LLM API at the time of writing:
 
-Threading: `generate_captions_parallel` uses ThreadPoolExecutor — the
-Anthropic SDK is thread-safe, so this is fine to call from a Streamlit
-handler. Don't touch Streamlit state from inside worker threads; use the
-progress callback to update UI from the main thread (which Streamlit calls
-between thread completions).
+    1,500 requests / day
+    1M input tokens / minute
+    10 requests / minute (the throttle that matters for parallel batches)
 
-Prompt caching: the system prompt is wrapped in `cache_control: ephemeral`.
-For Haiku 4.5 the minimum cacheable prefix is 4096 tokens — this prompt is
-below that, so cache won't activate today, but the marker is in place for
-when the system prompt grows or the threshold changes.
+Get a free key (no credit card) at https://aistudio.google.com/app/apikey.
+
+Threading: `generate_captions_parallel` uses ThreadPoolExecutor, capped at
+3 workers to stay well under the 10 RPM cap when a batch fires. The
+google-genai client is thread-safe.
 """
 from __future__ import annotations
 
-import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import anthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 
-DEFAULT_MODEL = "claude-haiku-4-5"
-DEFAULT_MAX_TOKENS = 200
-DEFAULT_MAX_WORKERS = 5
+# `gemini-2.5-flash` is the current free model with vision and the widest
+# project compatibility (some Google accounts have `limit: 0` quota on the
+# older `gemini-2.0-flash`). Both share the same API surface.
+DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MAX_WORKERS = 2  # free-tier RPM is tight — 2 workers + retry is safer than 3
+DEFAULT_MAX_OUTPUT_TOKENS = 400  # 2.5-flash thinks even with budget=0 reserved a chunk
+DEFAULT_RATE_LIMIT_RETRIES = 2
+DEFAULT_RATE_LIMIT_BACKOFF = 6.0  # seconds — Gemini's 429s typically clear within a few
+
 
 CAPTION_SYSTEM_PROMPT = """You are writing photograph captions for the Weekly Progress Report of a construction project.
 
@@ -75,60 +80,37 @@ Return only the caption text. Nothing else."""
 
 @dataclass
 class CaptionRequest:
-    """One photo to caption.
+    """One photo to caption."""
 
-    `activities` is the numbered "Daily Activities" list from that day's DCR
-    page 2 — passed as context so Claude can tie the scene to what was
-    actually being done. Empty list / None is fine.
-    """
     image_bytes: bytes
     media_type: str = "image/jpeg"
     activities: Optional[list[str]] = None
 
 
-def _system_blocks() -> list[dict]:
-    """System prompt wrapped with cache_control for forward-compat."""
-    return [
-        {
-            "type": "text",
-            "text": CAPTION_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
+def _clean_caption(text: str) -> str:
+    """Trim whitespace, surrounding quotes, and any leading 'Caption:' label."""
+    text = (text or "").strip()
+    for prefix in ("Caption:", "caption:", "CAPTION:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    return text.strip('"').strip("'").strip()
 
 
-def _user_content(req: CaptionRequest) -> list[dict]:
-    image_b64 = base64.b64encode(req.image_bytes).decode("ascii")
-    content: list[dict] = [
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": req.media_type,
-                "data": image_b64,
-            },
-        }
-    ]
+def _build_user_prompt(req: CaptionRequest) -> str:
     if req.activities:
         listed = "\n".join(f"  {i}. {a}" for i, a in enumerate(req.activities, 1))
-        content.append({
-            "type": "text",
-            "text": (
-                "For context, the Daily Construction Report for this day lists "
-                "the following site activities. Use them to inform your wording "
-                "if they match what's visible in the photo — otherwise describe "
-                "what you actually see and ignore them:\n\n" + listed +
-                "\n\nWrite the caption."
-            ),
-        })
-    else:
-        content.append({"type": "text", "text": "Write the caption."})
-    return content
+        return (
+            "For context, the Daily Construction Report for this day lists "
+            "the following site activities. Use them to inform your wording "
+            "if they match what's visible in the photo — otherwise describe "
+            "what you actually see and ignore them:\n\n" + listed +
+            "\n\nWrite the caption."
+        )
+    return "Write the caption."
 
 
-def _clean_caption(text: str) -> str:
-    """Trim whitespace and any stray surrounding quotation marks."""
-    return text.strip().strip('"').strip("'").strip()
+def _make_client(api_key: str) -> genai.Client:
+    return genai.Client(api_key=api_key)
 
 
 def generate_caption(
@@ -136,18 +118,31 @@ def generate_caption(
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    client: Optional[genai.Client] = None,
 ) -> str:
-    """Generate one caption synchronously. Raises anthropic.* errors on failure."""
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=_system_blocks(),
-        messages=[{"role": "user", "content": _user_content(req)}],
+    """Caption one photo synchronously."""
+    if client is None:
+        client = _make_client(api_key)
+
+    contents = [
+        genai_types.Part.from_bytes(data=req.image_bytes, mime_type=req.media_type),
+        _build_user_prompt(req),
+    ]
+    # gemini-2.5-flash defaults to thinking mode, which eats the output budget
+    # and truncates short captions. Disable thinking for a direct text response.
+    config = genai_types.GenerateContentConfig(
+        system_instruction=CAPTION_SYSTEM_PROMPT,
+        max_output_tokens=max_output_tokens,
+        temperature=0.4,
+        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
     )
-    text = next((b.text for b in response.content if b.type == "text"), "")
-    return _clean_caption(text)
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=config,
+    )
+    return _clean_caption(response.text)
 
 
 def generate_captions_parallel(
@@ -160,9 +155,9 @@ def generate_captions_parallel(
 ) -> list[str]:
     """Caption many photos in parallel. Returns a list aligned with `requests`.
 
-    On per-photo failure: returns an error string in that slot instead of
-    raising, so one bad image doesn't abort the whole batch. Cancels on
-    auth errors (those repeat for every photo — no point continuing).
+    Auth / permission failures cancel the rest of the batch — the same error
+    will hit every photo. Transient errors (rate limit, server error) are
+    reported per-photo so a single bad image doesn't lose the whole run.
     """
     if not requests:
         return []
@@ -170,25 +165,38 @@ def generate_captions_parallel(
     total = len(requests)
     results: list[Optional[str]] = [None] * total
     done = 0
+    client = _make_client(api_key)
 
     if progress_cb:
         progress_cb(0, total)
 
     def _run(i: int, req: CaptionRequest) -> tuple[int, str, bool]:
-        """Returns (index, caption, fatal). `fatal=True` means stop the batch."""
-        try:
-            caption = generate_caption(req, api_key=api_key, model=model)
-            return i, caption, False
-        except anthropic.AuthenticationError:
-            return i, "(AI caption failed: invalid Anthropic API key)", True
-        except anthropic.PermissionDeniedError:
-            return i, "(AI caption failed: API key lacks permission)", True
-        except anthropic.RateLimitError:
-            return i, "(AI caption failed: rate limited — try again later)", False
-        except anthropic.APIStatusError as e:
-            return i, f"(AI caption failed: API error {e.status_code})", False
-        except Exception as e:  # noqa: BLE001
-            return i, f"(AI caption failed: {type(e).__name__})", False
+        import time as _time
+        for attempt in range(DEFAULT_RATE_LIMIT_RETRIES + 1):
+            try:
+                caption = generate_caption(req, api_key=api_key, model=model, client=client)
+                if not caption:
+                    return i, "(AI caption failed: empty response)", False
+                return i, caption, False
+            except genai_errors.ClientError as e:
+                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                if code in (401, 403):
+                    return i, "(AI caption failed: invalid or unauthorized Gemini API key)", True
+                if code == 429 and attempt < DEFAULT_RATE_LIMIT_RETRIES:
+                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF * (attempt + 1))
+                    continue
+                if code == 429:
+                    return i, "(AI caption failed: free-tier quota / rate limit)", False
+                return i, f"(AI caption failed: client error {code or ''})", False
+            except genai_errors.ServerError as e:
+                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                if attempt < DEFAULT_RATE_LIMIT_RETRIES:
+                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF * (attempt + 1))
+                    continue
+                return i, f"(AI caption failed: server error {code or ''})", False
+            except Exception as e:  # noqa: BLE001
+                return i, f"(AI caption failed: {type(e).__name__})", False
+        return i, "(AI caption failed: retries exhausted)", False
 
     workers = max(1, min(max_workers, total))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -202,7 +210,6 @@ def generate_captions_parallel(
                 progress_cb(done, total)
             if fatal and not fatal_seen:
                 fatal_seen = True
-                # Cancel remaining tasks — the same error will hit every photo
                 for f in futures:
                     f.cancel()
 
