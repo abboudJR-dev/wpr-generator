@@ -28,10 +28,11 @@ from google.genai import types as genai_types
 # project compatibility (some Google accounts have `limit: 0` quota on the
 # older `gemini-2.0-flash`). Both share the same API surface.
 DEFAULT_MODEL = "gemini-2.5-flash"
-DEFAULT_MAX_WORKERS = 2  # free-tier RPM is tight — 2 workers + retry is safer than 3
+DEFAULT_MAX_WORKERS = 1  # free tier is 10 RPM — serial firing with delay is safest
+DEFAULT_INTER_REQUEST_DELAY = 6.5  # seconds — keeps effective rate at ~9 RPM
 DEFAULT_MAX_OUTPUT_TOKENS = 400  # 2.5-flash thinks even with budget=0 reserved a chunk
-DEFAULT_RATE_LIMIT_RETRIES = 2
-DEFAULT_RATE_LIMIT_BACKOFF = 6.0  # seconds — Gemini's 429s typically clear within a few
+DEFAULT_RATE_LIMIT_RETRIES = 3
+DEFAULT_RATE_LIMIT_BACKOFF = 30.0  # seconds — Gemini RPM window is 60s, so 30s wait fits 2 retries inside
 
 
 CAPTION_SYSTEM_PROMPT = """You are writing photograph captions for the Weekly Progress Report of a construction project.
@@ -145,20 +146,42 @@ def generate_caption(
     return _clean_caption(response.text)
 
 
+def _classify_429(error_text: str) -> str:
+    """Tell apart permanent quota issues from transient rate limits."""
+    et = error_text.lower()
+    if "limit: 0" in et or "quotaid" in et and "perdayperprojectpermodel-freetier" in et and "limit: 0" in et:
+        return (
+            "AI caption failed: this Google project has limit:0 free-tier quota for Gemini. "
+            "Fix at https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com "
+            "(enable the API) — or make a key from a different Google account at aistudio.google.com."
+        )
+    if "perminute" in et.replace(" ", ""):
+        return "AI caption failed: 10 RPM rate limit. Try again in 60 seconds."
+    if "perday" in et.replace(" ", ""):
+        return "AI caption failed: daily request limit (~250/day) reached. Try again tomorrow."
+    return "AI caption failed: free-tier quota / rate limit (see app logs for detail)"
+
+
 def generate_captions_parallel(
     requests: list[CaptionRequest],
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    inter_request_delay: float = DEFAULT_INTER_REQUEST_DELAY,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> list[str]:
-    """Caption many photos in parallel. Returns a list aligned with `requests`.
+    """Caption many photos with throttling. Returns a list aligned with `requests`.
 
-    Auth / permission failures cancel the rest of the batch — the same error
-    will hit every photo. Transient errors (rate limit, server error) are
-    reported per-photo so a single bad image doesn't lose the whole run.
+    Defaults to 1 worker + 6.5s inter-request spacing → ~9 RPM effective, safely
+    under Gemini's 10 RPM free-tier ceiling. 12 photos run in about 80s.
+
+    Auth/permission failures cancel the rest of the batch. Transient errors
+    (rate limit, server error) are retried with exponential backoff up to
+    DEFAULT_RATE_LIMIT_RETRIES times.
     """
+    import time as _time
+
     if not requests:
         return []
 
@@ -171,7 +194,6 @@ def generate_captions_parallel(
         progress_cb(0, total)
 
     def _run(i: int, req: CaptionRequest) -> tuple[int, str, bool]:
-        import time as _time
         for attempt in range(DEFAULT_RATE_LIMIT_RETRIES + 1):
             try:
                 caption = generate_caption(req, api_key=api_key, model=model, client=client)
@@ -180,24 +202,47 @@ def generate_captions_parallel(
                 return i, caption, False
             except genai_errors.ClientError as e:
                 code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                err_text = str(e)
                 if code in (401, 403):
                     return i, "(AI caption failed: invalid or unauthorized Gemini API key)", True
                 if code == 429 and attempt < DEFAULT_RATE_LIMIT_RETRIES:
-                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF * (attempt + 1))
+                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
                     continue
                 if code == 429:
-                    return i, "(AI caption failed: free-tier quota / rate limit)", False
+                    return i, f"({_classify_429(err_text)})", False
                 return i, f"(AI caption failed: client error {code or ''})", False
             except genai_errors.ServerError as e:
                 code = getattr(e, "code", None) or getattr(e, "status_code", None)
                 if attempt < DEFAULT_RATE_LIMIT_RETRIES:
-                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF * (attempt + 1))
+                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
                     continue
                 return i, f"(AI caption failed: server error {code or ''})", False
             except Exception as e:  # noqa: BLE001
                 return i, f"(AI caption failed: {type(e).__name__})", False
         return i, "(AI caption failed: retries exhausted)", False
 
+    # Serial execution preserves order and lets us throttle precisely.
+    if max_workers <= 1:
+        for idx, req in enumerate(requests):
+            i, caption, fatal = _run(idx, req)
+            results[i] = caption
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+            if fatal:
+                # Same error will hit every photo — fill remainder and bail
+                for j in range(idx + 1, total):
+                    if results[j] is None:
+                        results[j] = caption
+                        done += 1
+                        if progress_cb:
+                            progress_cb(done, total)
+                break
+            if idx < total - 1 and inter_request_delay > 0:
+                _time.sleep(inter_request_delay)
+        return [r or "(no result)" for r in results]
+
+    # Parallel path (kept for callers that pass max_workers > 1 explicitly)
     workers = max(1, min(max_workers, total))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_run, i, r): i for i, r in enumerate(requests)}
