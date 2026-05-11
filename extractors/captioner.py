@@ -1,38 +1,39 @@
-"""AI-powered photo caption generator (Google Gemini 2.0 Flash).
+"""AI-powered photo caption generator (Groq Llama 3.2 11B Vision).
 
-Uses Gemini 2.0 Flash because it has the most generous free tier of any
-vision-capable LLM API at the time of writing:
+Why Groq: their free tier is the most generous of any vision-capable LLM
+API at the time of writing. Typical limits (Llama 3.2 11B Vision Preview):
 
-    1,500 requests / day
-    1M input tokens / minute
-    10 requests / minute (the throttle that matters for parallel batches)
+    ~14,400 requests / day  (≈57× Gemini Flash's 250/day)
+    ~30 requests / minute
+    ~7,000 tokens / minute
 
-Get a free key (no credit card) at https://aistudio.google.com/app/apikey.
+Get a free key (no credit card) at https://console.groq.com.
 
-Threading: `generate_captions_parallel` uses ThreadPoolExecutor, capped at
-3 workers to stay well under the 10 RPM cap when a batch fires. The
-google-genai client is thread-safe.
+Threading: `generate_captions_parallel` uses ThreadPoolExecutor. Groq's
+RPM cap on free tier is high enough that 4 workers is comfortable for a
+12-photo batch. The groq client is thread-safe.
+
+If you ever want to A/B caption quality, swap `DEFAULT_MODEL` to
+`llama-3.2-90b-vision-preview` (better quality, lower RPD ~1,000) or
+the newer Llama 4 multimodal variants when stable.
 """
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types as genai_types
+import groq
+from groq import Groq
 
 
-# `gemini-2.5-flash` is the current free model with vision and the widest
-# project compatibility (some Google accounts have `limit: 0` quota on the
-# older `gemini-2.0-flash`). Both share the same API surface.
-DEFAULT_MODEL = "gemini-2.5-flash"
-DEFAULT_MAX_WORKERS = 1  # free tier is 10 RPM — serial firing with delay is safest
-DEFAULT_INTER_REQUEST_DELAY = 6.5  # seconds — keeps effective rate at ~9 RPM
-DEFAULT_MAX_OUTPUT_TOKENS = 400  # 2.5-flash thinks even with budget=0 reserved a chunk
-DEFAULT_RATE_LIMIT_RETRIES = 1  # one retry only — if the first 429 isn't transient, more won't help
-DEFAULT_RATE_LIMIT_BACKOFF = 15.0  # seconds — half the RPM window, fast enough to bail early
+DEFAULT_MODEL = "llama-3.2-11b-vision-preview"
+DEFAULT_MAX_WORKERS = 4              # Groq free tier: ~30 RPM, 4 workers is safe
+DEFAULT_INTER_REQUEST_DELAY = 0.0    # no throttle needed
+DEFAULT_MAX_OUTPUT_TOKENS = 200
+DEFAULT_RATE_LIMIT_RETRIES = 1
+DEFAULT_RATE_LIMIT_BACKOFF = 8.0
 
 
 CAPTION_SYSTEM_PROMPT = """You are writing photograph captions for the Weekly Progress Report of a construction project.
@@ -97,7 +98,7 @@ def _clean_caption(text: str) -> str:
     return text.strip('"').strip("'").strip()
 
 
-def _build_user_prompt(req: CaptionRequest) -> str:
+def _build_user_text(req: CaptionRequest) -> str:
     if req.activities:
         listed = "\n".join(f"  {i}. {a}" for i, a in enumerate(req.activities, 1))
         return (
@@ -110,8 +111,8 @@ def _build_user_prompt(req: CaptionRequest) -> str:
     return "Write the caption."
 
 
-def _make_client(api_key: str) -> genai.Client:
-    return genai.Client(api_key=api_key)
+def _make_client(api_key: str) -> Groq:
+    return Groq(api_key=api_key)
 
 
 def generate_caption(
@@ -120,63 +121,53 @@ def generate_caption(
     api_key: str,
     model: str = DEFAULT_MODEL,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
-    client: Optional[genai.Client] = None,
+    client: Optional[Groq] = None,
 ) -> str:
-    """Caption one photo synchronously."""
+    """Caption one photo synchronously via Groq."""
     if client is None:
         client = _make_client(api_key)
 
-    contents = [
-        genai_types.Part.from_bytes(data=req.image_bytes, mime_type=req.media_type),
-        _build_user_prompt(req),
-    ]
-    # gemini-2.5-flash defaults to thinking mode, which eats the output budget
-    # and truncates short captions. Disable thinking for a direct text response.
-    config = genai_types.GenerateContentConfig(
-        system_instruction=CAPTION_SYSTEM_PROMPT,
-        max_output_tokens=max_output_tokens,
-        temperature=0.4,
-        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-    )
-    response = client.models.generate_content(
+    image_b64 = base64.b64encode(req.image_bytes).decode("ascii")
+    response = client.chat.completions.create(
         model=model,
-        contents=contents,
-        config=config,
+        max_tokens=max_output_tokens,
+        temperature=0.4,
+        messages=[
+            {"role": "system", "content": CAPTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _build_user_text(req)},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{req.media_type};base64,{image_b64}",
+                        },
+                    },
+                ],
+            },
+        ],
     )
-    return _clean_caption(response.text)
-
-
-def _is_limit_zero(error_text: str) -> bool:
-    """True if the 429 means 'project has zero free-tier quota' (permanent)."""
-    et = error_text.lower()
-    return "limit: 0" in et or "limit:0" in et
-
-
-def _is_batch_doomed_429(error_text: str) -> bool:
-    """True if every other photo in the batch will hit the same 429.
-
-    Covers: limit:0 (zero free-tier quota allocated) and per-day quotas
-    (250/day for gemini-2.5-flash). Per-minute rate limits return False —
-    those are transient and may clear within the minute.
-    """
-    et = error_text.replace(" ", "").lower()
-    return _is_limit_zero(error_text) or "perday" in et
+    return _clean_caption(response.choices[0].message.content)
 
 
 def _classify_429(error_text: str) -> str:
-    """Tell apart permanent quota issues from transient rate limits."""
+    """Pick a friendly message for Groq rate-limit / quota errors."""
     et = error_text.lower()
-    if _is_limit_zero(error_text):
+    if "rpd" in et or "per-day" in et or "daily" in et:
         return (
-            "AI caption failed: this Google project has limit:0 free-tier quota for Gemini. "
-            "Fix at https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com "
-            "(enable the API) — or make a key from a different Google account at aistudio.google.com."
+            "AI caption failed: Groq daily request limit reached. "
+            "Try again tomorrow or generate a new key at console.groq.com."
         )
-    if "perminute" in et.replace(" ", ""):
-        return "AI caption failed: 10 RPM rate limit. Try again in 60 seconds."
-    if "perday" in et.replace(" ", ""):
-        return "AI caption failed: daily request limit (~250/day) reached. Try again tomorrow."
-    return "AI caption failed: free-tier quota / rate limit (see app logs for detail)"
+    if "rpm" in et or "per-minute" in et or "minute" in et:
+        return "AI caption failed: Groq per-minute rate limit. Retrying…"
+    return "AI caption failed: Groq rate limit (try again in a minute)"
+
+
+def _is_batch_doomed_429(error_text: str) -> bool:
+    """True if every other photo in the batch will hit the same 429."""
+    et = error_text.lower()
+    return "rpd" in et or "per-day" in et or "daily" in et
 
 
 def generate_captions_parallel(
@@ -188,14 +179,11 @@ def generate_captions_parallel(
     inter_request_delay: float = DEFAULT_INTER_REQUEST_DELAY,
     progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> list[str]:
-    """Caption many photos with throttling. Returns a list aligned with `requests`.
+    """Caption many photos in parallel via Groq.
 
-    Defaults to 1 worker + 6.5s inter-request spacing → ~9 RPM effective, safely
-    under Gemini's 10 RPM free-tier ceiling. 12 photos run in about 80s.
-
-    Auth/permission failures cancel the rest of the batch. Transient errors
-    (rate limit, server error) are retried with exponential backoff up to
-    DEFAULT_RATE_LIMIT_RETRIES times.
+    Defaults are tuned for Groq's free tier: 4 workers, no inter-request
+    delay (Groq's free RPM is high enough). 12 photos typically completes
+    in 5-10 seconds.
     """
     import time as _time
 
@@ -217,34 +205,28 @@ def generate_captions_parallel(
                 if not caption:
                     return i, "(AI caption failed: empty response)", False
                 return i, caption, False
-            except genai_errors.ClientError as e:
-                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            except groq.AuthenticationError:
+                return i, "(AI caption failed: invalid Groq API key)", True
+            except groq.PermissionDeniedError:
+                return i, "(AI caption failed: Groq API key lacks permission)", True
+            except groq.RateLimitError as e:
                 err_text = str(e)
-                if code in (401, 403):
-                    return i, "(AI caption failed: invalid or unauthorized Gemini API key)", True
-                if code == 429:
-                    # limit:0 and per-day quota errors will hit every other
-                    # photo identically — no retry or per-minute backoff will
-                    # help today. Bail out fatally so the batch ends in seconds
-                    # instead of grinding through 12 × 25s of doomed retries.
-                    if _is_batch_doomed_429(err_text):
-                        return i, f"({_classify_429(err_text)})", True
-                    if attempt < DEFAULT_RATE_LIMIT_RETRIES:
-                        _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
-                        continue
-                    return i, f"({_classify_429(err_text)})", False
-                return i, f"(AI caption failed: client error {code or ''})", False
-            except genai_errors.ServerError as e:
-                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                if _is_batch_doomed_429(err_text):
+                    return i, f"({_classify_429(err_text)})", True
                 if attempt < DEFAULT_RATE_LIMIT_RETRIES:
                     _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
                     continue
-                return i, f"(AI caption failed: server error {code or ''})", False
+                return i, f"({_classify_429(err_text)})", False
+            except groq.APIStatusError as e:
+                code = getattr(e, "status_code", None)
+                if attempt < DEFAULT_RATE_LIMIT_RETRIES:
+                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
+                    continue
+                return i, f"(AI caption failed: Groq API error {code or ''})", False
             except Exception as e:  # noqa: BLE001
                 return i, f"(AI caption failed: {type(e).__name__})", False
         return i, "(AI caption failed: retries exhausted)", False
 
-    # Serial execution preserves order and lets us throttle precisely.
     if max_workers <= 1:
         for idx, req in enumerate(requests):
             i, caption, fatal = _run(idx, req)
@@ -253,7 +235,6 @@ def generate_captions_parallel(
             if progress_cb:
                 progress_cb(done, total)
             if fatal:
-                # Same error will hit every photo — fill remainder and bail
                 for j in range(idx + 1, total):
                     if results[j] is None:
                         results[j] = caption
@@ -265,7 +246,6 @@ def generate_captions_parallel(
                 _time.sleep(inter_request_delay)
         return [r or "(no result)" for r in results]
 
-    # Parallel path (kept for callers that pass max_workers > 1 explicitly)
     workers = max(1, min(max_workers, total))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_run, i, r): i for i, r in enumerate(requests)}

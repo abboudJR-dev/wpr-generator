@@ -47,25 +47,24 @@ from extractors.logs import LogsData, parse_logs
 from PIL import Image
 
 
-def _resolve_gemini_key() -> Optional[str]:
-    """Look for the Gemini key in: st.secrets → env var → session state.
+def _resolve_groq_key() -> Optional[str]:
+    """Look for the Groq key in: st.secrets → env var → session state.
 
-    Streamlit Cloud users set `GEMINI_API_KEY` in the app's Secrets UI
-    (Settings → Secrets); local users can `set GEMINI_API_KEY=…` or enter
+    Streamlit Cloud users set `GROQ_API_KEY` in the app's Secrets UI
+    (Settings → Secrets); local users can `set GROQ_API_KEY=…` or enter
     it via the in-app prompt (kept in session memory only). Get a free
-    key at https://aistudio.google.com/app/apikey (no credit card).
+    key at https://console.groq.com (no credit card).
     """
-    for env_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        try:
-            key = st.secrets.get(env_name)
-            if key:
-                return key
-        except (FileNotFoundError, KeyError, AttributeError):
-            pass
-        env_key = os.environ.get(env_name)
-        if env_key:
-            return env_key
-    return st.session_state.get("gemini_api_key")
+    try:
+        key = st.secrets.get("GROQ_API_KEY")
+        if key:
+            return key
+    except (FileNotFoundError, KeyError, AttributeError):
+        pass
+    env_key = os.environ.get("GROQ_API_KEY")
+    if env_key:
+        return env_key
+    return st.session_state.get("groq_api_key")
 
 
 @st.cache_data(show_spinner=False)
@@ -477,25 +476,25 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
     """
     st.subheader("AI caption generator")
     st.caption(
-        "Sends the selected Photo A / Photo B for each day to Google Gemini 2.5 Flash, "
+        "Sends the selected Photo A / Photo B for each day to Groq's Llama 3.2 11B Vision, "
         "along with that day's recorded site activities, and asks for a one-sentence "
-        "caption in the same tone as the reference deck. ~10-20 seconds for 12 photos. "
-        "Free key: https://aistudio.google.com/app/apikey (no credit card)."
+        "caption in the same tone as the reference deck. ~5-10 seconds for 12 photos. "
+        "Free key: https://console.groq.com (no credit card, ~14,400 free requests/day)."
     )
 
-    api_key = _resolve_gemini_key()
+    api_key = _resolve_groq_key()
     if not api_key:
         st.info(
-            "Enter your free Gemini API key to enable AI captioning. "
-            "Get one at https://aistudio.google.com/app/apikey (no credit card). "
-            "Set `GEMINI_API_KEY` in Streamlit Cloud Secrets to skip this every visit."
+            "Enter your free Groq API key to enable AI captioning. "
+            "Get one at https://console.groq.com (no credit card, much higher free limit than Gemini). "
+            "Set `GROQ_API_KEY` in Streamlit Cloud Secrets to skip this every visit."
         )
         user_key = st.text_input(
-            "Gemini API key", type="password", key="api_key_input",
-            placeholder="AIza…",
+            "Groq API key", type="password", key="api_key_input",
+            placeholder="gsk_…",
         )
         if user_key:
-            st.session_state["gemini_api_key"] = user_key
+            st.session_state["groq_api_key"] = user_key
             api_key = user_key
 
     gen_btn = st.button(
