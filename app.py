@@ -477,7 +477,7 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
     """
     st.subheader("AI caption generator")
     st.caption(
-        "Sends the selected Photo A / Photo B for each day to Google Gemini 2.0 Flash, "
+        "Sends the selected Photo A / Photo B for each day to Google Gemini 2.5 Flash, "
         "along with that day's recorded site activities, and asks for a one-sentence "
         "caption in the same tone as the reference deck. ~10-20 seconds for 12 photos. "
         "Free key: https://aistudio.google.com/app/apikey (no credit card)."
@@ -502,6 +502,32 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
         "Generate captions with AI",
         disabled=not api_key, type="primary", key="gen_captions_btn",
     )
+
+    # If a previous run generated captions, show them inline below the button so
+    # the user can see what was produced without scrolling back up to the per-day
+    # caption fields. Lives in session_state because the button click rerenders.
+    last_results = st.session_state.get("ai_caption_results")
+    if last_results:
+        st.markdown("### Generated captions")
+        success_count = sum(1 for r in last_results if not r["caption"].startswith("(AI caption failed"))
+        if success_count == len(last_results):
+            st.success(f"Generated {success_count} captions and wrote them into the fields above. Edit any as needed.")
+        elif success_count == 0:
+            st.error(
+                f"Captioning failed for all {len(last_results)} photos. "
+                "Common causes: invalid Gemini API key, quota exhausted, or network issue. "
+                "See the error text below each row for the specific reason."
+            )
+        else:
+            st.warning(f"Generated {success_count} of {len(last_results)} captions. The others failed — see below.")
+
+        for r in last_results:
+            failed = r["caption"].startswith("(AI caption failed")
+            icon = "❌" if failed else "✅"
+            st.markdown(
+                f"{icon} **{r['day_label']} — Photo {r['slot'].upper()}** ({r['date']}): "
+                f"{r['caption']}"
+            )
 
     if gen_btn and api_key:
         # Map each selected A/B photo to a captioning request, with the DCR's
@@ -540,11 +566,23 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
         progress.empty()
 
         # Write captions back to state
+        results_for_display = []
         for caption, (i, slot) in zip(captions, slot_map):
             if slot == "a":
                 state.photo_days[i].caption_a = caption
             else:
                 state.photo_days[i].caption_b = caption
+            day_label = state.photo_day_labels[i] if i < len(state.photo_day_labels) else f"Day {i+1}"
+            date_str = state.photo_dates[i].strftime("%d %b %Y") if i < len(state.photo_dates) else ""
+            results_for_display.append({
+                "day_label": day_label,
+                "slot": slot,
+                "date": date_str,
+                "caption": caption,
+            })
+
+        # Persist for inline display after the rerun
+        st.session_state["ai_caption_results"] = results_for_display
 
         # Clear the per-day caption text-input widget keys so they re-init
         # from state.photo_days on the next render (Streamlit text inputs
@@ -555,14 +593,6 @@ def _render_ai_caption_block(state: WPRState, dcrs: list[DCRData]) -> None:
                 if key in st.session_state:
                     del st.session_state[key]
 
-        failures = sum(1 for c in captions if c.startswith("(AI caption failed"))
-        if failures:
-            st.warning(
-                f"Generated {len(captions) - failures}/{len(captions)} captions. "
-                f"{failures} failed — see individual fields above."
-            )
-        else:
-            st.success(f"Generated {len(captions)} captions. Scroll up to review and edit.")
         st.rerun()
 
 
