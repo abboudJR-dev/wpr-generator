@@ -31,8 +31,8 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_MAX_WORKERS = 1  # free tier is 10 RPM — serial firing with delay is safest
 DEFAULT_INTER_REQUEST_DELAY = 6.5  # seconds — keeps effective rate at ~9 RPM
 DEFAULT_MAX_OUTPUT_TOKENS = 400  # 2.5-flash thinks even with budget=0 reserved a chunk
-DEFAULT_RATE_LIMIT_RETRIES = 3
-DEFAULT_RATE_LIMIT_BACKOFF = 30.0  # seconds — Gemini RPM window is 60s, so 30s wait fits 2 retries inside
+DEFAULT_RATE_LIMIT_RETRIES = 1  # one retry only — if the first 429 isn't transient, more won't help
+DEFAULT_RATE_LIMIT_BACKOFF = 15.0  # seconds — half the RPM window, fast enough to bail early
 
 
 CAPTION_SYSTEM_PROMPT = """You are writing photograph captions for the Weekly Progress Report of a construction project.
@@ -146,10 +146,16 @@ def generate_caption(
     return _clean_caption(response.text)
 
 
+def _is_limit_zero(error_text: str) -> bool:
+    """True if the 429 means 'project has zero free-tier quota' (permanent)."""
+    et = error_text.lower()
+    return "limit: 0" in et or "limit:0" in et
+
+
 def _classify_429(error_text: str) -> str:
     """Tell apart permanent quota issues from transient rate limits."""
     et = error_text.lower()
-    if "limit: 0" in et or "quotaid" in et and "perdayperprojectpermodel-freetier" in et and "limit: 0" in et:
+    if _is_limit_zero(error_text):
         return (
             "AI caption failed: this Google project has limit:0 free-tier quota for Gemini. "
             "Fix at https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com "
@@ -205,10 +211,15 @@ def generate_captions_parallel(
                 err_text = str(e)
                 if code in (401, 403):
                     return i, "(AI caption failed: invalid or unauthorized Gemini API key)", True
-                if code == 429 and attempt < DEFAULT_RATE_LIMIT_RETRIES:
-                    _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
-                    continue
                 if code == 429:
+                    # limit:0 is permanent — no retry will help, and it's the
+                    # same error every other photo will hit. Bail out fatally
+                    # so the whole batch stops fast.
+                    if _is_limit_zero(err_text):
+                        return i, f"({_classify_429(err_text)})", True
+                    if attempt < DEFAULT_RATE_LIMIT_RETRIES:
+                        _time.sleep(DEFAULT_RATE_LIMIT_BACKOFF)
+                        continue
                     return i, f"({_classify_429(err_text)})", False
                 return i, f"(AI caption failed: client error {code or ''})", False
             except genai_errors.ServerError as e:
