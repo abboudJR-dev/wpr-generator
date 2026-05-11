@@ -1,0 +1,13 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+maxUploadSize = 200
+enableXsrfProtection = true
+
+[theme]
+primaryColor = "#0E9F8F"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#1A2332"
+font = "sans serif"

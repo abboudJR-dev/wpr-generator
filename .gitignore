@@ -1,0 +1,50 @@
+# Sensitive / project-specific data — never push
+reference/sample_dcrs/
+reference/sample_logs.xlsx
+reference/Weekly_Report_No_020_ENHANCED_v2.pptx
+reference/scaffolding/
+
+# Generated decks
+output/
+
+# PyInstaller build artefacts
+build/
+dist/
+*.spec.bak
+
+# Local scripts / scratchpads
+inspect_data.py
+compare_decks.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Claude session
+.claude/
+
+# Misc
+*.log
+*.tmp
